@@ -1,16 +1,20 @@
 mod dynchunkiter;
 mod erc165;
 mod erc721;
+mod storage;
+mod types;
 
-use std::{collections::HashMap, env, fs::File, ops::Range};
+use std::{collections::HashMap, env, fs::File, ops::Range, io};
 use async_recursion::async_recursion;
 use dynchunkiter::DynChunkIter;
 use hex_literal::hex;
 use serde::{Deserialize, Serialize};
+use storage::{memory::MemoryStorage, Storage};
 use web3::{
     types::{FilterBuilder, Log, H256, U256, U64},
     Transport, Web3,
 };
+use types::ContractType;
 
 const PERSISTENCE_PATH: &'static str = "./contracts.json";
 const TOO_MANY_RESULTS_ERRCODE: i64 = -32005;
@@ -76,26 +80,22 @@ async fn task<T: Transport>(w3: &Web3<T>, range: Range<U64>) -> Result<usize, Ta
 }
 
 async fn processLogs<T: Transport>(w3: &Web3<T>, logs: Vec<Log>) -> Result<(), TaskError> {
-    // Read cached contact type info from file
-    let mut contracts = match File::open(PERSISTENCE_PATH) {
-        Ok(f) => serde_json::from_reader(f).unwrap(),
-        Err(_) => HashMap::new(),
-    };
+    let mut storage = MemoryStorage::new(PERSISTENCE_PATH)?;
 
     // TODO: Don't stop after 40 entries, this is just to prevent sending too
     // many requests while testing.
     for log in &logs[..40] {
-        // Get type from cache or request it.
-        let contract_type = match contracts.get(&log.address) {
-            Some(t) => *t,
+        let contract_type = match storage.get_contract_type(log.address) {
+            Some(t) => t,
             None => {
-                // We don't have it yet. This should always write to the HashMap, but just
-                // in case we do modify it in paralell in the future this throws away the
-                // just requested contract type (earliest write first). Both return the same
-                // value unless the smart contract has weird behavior.
+                // We don't have it yet. This should always write to storage,
+                // but just in case we do modify it in paralell in the future
+                // this throws away the just requested contract type (earliest
+                // write first). Both return the same value unless the smart
+                // contract has weird behavior.
                 let t = contract_type(w3, &log).await?;
-                *contracts.entry(log.address).or_insert(t)
-            }
+                storage.store_contract_type(log.address, t)
+            },
         };
 
         match contract_type {
@@ -133,8 +133,7 @@ async fn processLogs<T: Transport>(w3: &Web3<T>, logs: Vec<Log>) -> Result<(), T
     }
 
     // Store contact type info back to file
-    let f = File::create(PERSISTENCE_PATH).unwrap();
-    serde_json::to_writer(f, &contracts).unwrap();
+    storage.persist().unwrap();
 
     Ok(())
 }
@@ -167,6 +166,7 @@ async fn contract_type<T: Transport>(
 enum TaskError {
     Web3(web3::Error),
     Erc165(erc165::Error),
+    IO(io::Error),
 }
 
 impl From<web3::Error> for TaskError {
@@ -179,11 +179,8 @@ impl From<erc165::Error> for TaskError {
         TaskError::Erc165(e)
     }
 }
-
-#[derive(Serialize, Deserialize, Debug, Copy, Clone)]
-enum ContractType {
-    Unknown,
-    UnknownERC165,
-    ERC721 { metadata: bool, enumerable: bool },
-    MaybeERC20,
+impl From<io::Error> for TaskError {
+    fn from(e: io::Error) -> Self {
+        TaskError::IO(e)
+    }
 }
