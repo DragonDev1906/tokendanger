@@ -33,7 +33,7 @@ pub async fn supports_interface_unchecked<T: Transport>(
         Ok(Bytes(ret)) => {
             // Result must be 32 bytes and only the last bit is allowed to be 1
             if ret.len() != 32 || !ret[..31].eq(&[0; 31]) || ret[31] & 0xfe != 0 {
-                Err(Error::NotSupported)
+                Ok(false)
             } else {
                 Ok(ret[31] & 1 == 1)
             }

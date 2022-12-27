@@ -1,11 +1,7 @@
-use std::{
-    collections::{HashMap, HashSet},
-    env,
-    fs::File,
-    io,
-    ops::Range,
-};
+use std::{collections::HashMap, env, fs::File, ops::Range};
 
+use async_recursion::async_recursion;
+use dynchunkiter::DynChunkIter;
 use hex_literal::hex;
 use serde::{Deserialize, Serialize, Serializer};
 use web3::{
@@ -13,6 +9,7 @@ use web3::{
     Transport, Web3,
 };
 
+mod dynchunkiter;
 mod erc165;
 mod erc721;
 
@@ -27,6 +24,21 @@ async fn main() {
 
     let transport = web3::transports::Http::new(&url).expect("could not connec to infura");
     let w3 = Web3::new(transport);
+
+    // Go-Ethereum allows up to 10_000 return values, to avoid too many errors
+    // we instead target a smaller amount.
+    let mut iter = DynChunkIter::new(16249100, 10, 8_000);
+    while let Some(chunk) = iter.next() {
+        // Retry as long as the range is too large
+        let range = chunk.start.into()..chunk.end.into();
+        match task(&w3, range).await {
+            Ok(amount) => {
+                println!("Task Amount: {}", amount);
+                iter.update_chunk_size(amount);
+            },
+            Err(e) => panic!("Task returned error: {:?}", e),
+        }
+    }
 
     // Get latest block height
     // let block_num = w3
@@ -44,9 +56,6 @@ async fn main() {
     // println!("Is EIP-721: {}", is721);
 
     // Topic filter
-    let count = 2;
-    let end = 16249135;
-    let start = end - count;
     // let filter = FilterBuilder::default()
     //     .from_block(start.into())
     //     .to_block(end.into())
@@ -76,7 +85,7 @@ async fn main() {
     // println!("Tokens: {}", token_count);
     // println!("Unique Tokens: {}", tokens.len());
 
-    task(&w3, start.into()..end.into()).await.unwrap();
+    // task(&w3, start.into()..end.into()).await.unwrap();
 }
 
 #[derive(Debug, PartialEq, Eq, Ord, PartialOrd)]
@@ -127,24 +136,17 @@ async fn contract_type<T: Transport>(
 }
 
 const PERSISTENCE_PATH: &'static str = "./contracts.json";
+const TOO_MANY_RESULTS_ERRCODE: i64 = -32005;
 
-async fn task<T: Transport>(w3: &Web3<T>, range: Range<U64>) -> Result<(), TaskError> {
-    // ERC721_TRANSFER_EVENT also catches ERC20 Transfers, as the only
-    // difference is that the third param is indexed.
-    let topic1 = vec![ERC721_TRANSFER_EVENT];
-    let filter = FilterBuilder::default()
-        .from_block(range.start.into())
-        .to_block(range.end.into())
-        .topics(Some(topic1), None, None, None)
-        .build();
-    let logs = w3.eth().logs(filter).await?;
-
+async fn processLogs<T: Transport>(w3: &Web3<T>, logs: Vec<Log>) -> Result<(), TaskError> {
     // Read cached contact type info from file
     let mut contracts = match File::open(PERSISTENCE_PATH) {
         Ok(f) => serde_json::from_reader(f).unwrap(),
         Err(_) => HashMap::new(),
     };
 
+    // TODO: Don't stop after 40 entries, this is just to prevent sending too
+    // many requests while testing.
     for log in &logs[..40] {
         // Get type from cache or request it.
         let contract_type = match contracts.get(&log.address) {
@@ -198,6 +200,39 @@ async fn task<T: Transport>(w3: &Web3<T>, range: Range<U64>) -> Result<(), TaskE
     serde_json::to_writer(f, &contracts).unwrap();
 
     Ok(())
+}
+
+#[async_recursion(?Send)]
+async fn task<T: Transport>(w3: &Web3<T>, range: Range<U64>) -> Result<usize, TaskError> {
+    // ERC721_TRANSFER_EVENT also catches ERC20 Transfers, as the only
+    // difference is that the third param is indexed.
+
+    // Request all relevant events in this range.
+    let topic1 = vec![ERC721_TRANSFER_EVENT];
+    let filter = FilterBuilder::default()
+        .from_block(range.start.into())
+        .to_block(range.end.into())
+        .topics(Some(topic1), None, None, None)
+        .build();
+    let logs = match w3.eth().logs(filter).await {
+        Ok(v) => v,
+        Err(web3::Error::Rpc(e)) if e.code.code() == TOO_MANY_RESULTS_ERRCODE => {
+            // Split range in two parts and call recursively (try to avoid this
+            // case as it results in a "useless" call that just returns the too
+            // many results error).
+            let middle = (range.start + range.end) / 2;
+            let lower_amount = task(w3, range.start..middle).await?;
+            let upper_amount = task(w3, middle..range.end).await?;
+            return Ok(lower_amount + upper_amount);
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let return_amount = logs.len();
+
+    // Process the results we got.
+    processLogs(w3, logs).await?;
+
+    Ok(return_amount)
 }
 
 #[derive(Serialize, Deserialize, Debug, Copy, Clone)]

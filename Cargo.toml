@@ -11,3 +11,4 @@ tokio = "1.23.0"
 hex-literal = "0.3.4"
 serde_json = "1.0.91"
 serde = {version = "1.0.151", features = ["derive"]}
+async-recursion = "1.0.0"
