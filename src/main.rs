@@ -4,11 +4,10 @@ mod erc721;
 mod storage;
 mod types;
 
-use std::{collections::HashMap, env, fs::File, ops::Range, io};
+use std::{env, ops::Range, io};
 use async_recursion::async_recursion;
 use dynchunkiter::DynChunkIter;
 use hex_literal::hex;
-use serde::{Deserialize, Serialize};
 use storage::{memory::MemoryStorage, Storage};
 use web3::{
     types::{FilterBuilder, Log, H256, U256, U64},
@@ -74,12 +73,12 @@ async fn task<T: Transport>(w3: &Web3<T>, range: Range<U64>) -> Result<usize, Ta
     let return_amount = logs.len();
 
     // Process the results we got.
-    processLogs(w3, logs).await?;
+    process_logs(w3, logs).await?;
 
     Ok(return_amount)
 }
 
-async fn processLogs<T: Transport>(w3: &Web3<T>, logs: Vec<Log>) -> Result<(), TaskError> {
+async fn process_logs<T: Transport>(w3: &Web3<T>, logs: Vec<Log>) -> Result<(), TaskError> {
     let mut storage = MemoryStorage::new(PERSISTENCE_PATH)?;
 
     // TODO: Don't stop after 40 entries, this is just to prevent sending too

@@ -38,8 +38,4 @@ impl DynChunkIter {
             self.chunk_size = self.chunk_size * self.target_amount / amount;
         }
     }
-
-    pub fn half_chunk_size(&mut self) {
-        self.chunk_size = self.chunk_size >> 1;
-    }
 }

@@ -75,9 +75,9 @@ macro_rules! make_is_interface_unchecked {
     };
 }
 
-make_is_interface!(is_erc721, "80ac58cd");
-make_is_interface!(is_erc721metadata, "5b5e139f");
-make_is_interface!(is_erc721enumerable, "780e9d63");
+// make_is_interface!(is_erc721, "80ac58cd");
+// make_is_interface!(is_erc721metadata, "5b5e139f");
+// make_is_interface!(is_erc721enumerable, "780e9d63");
 make_is_interface_unchecked!(is_erc721_unchecked, "80ac58cd");
 make_is_interface_unchecked!(is_erc721metadata_unchecked, "5b5e139f");
 make_is_interface_unchecked!(is_erc721enumerable_unchecked, "780e9d63");

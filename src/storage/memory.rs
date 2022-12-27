@@ -1,20 +1,43 @@
 use std::{collections::HashMap, fs::File, io::{ErrorKind, self}};
 use serde::{Deserialize, Serialize};
-use web3::types::Address;
+use web3::types::{Address, U256};
 use crate::types::ContractType;
 
 use super::{Storage};
 
-#[derive(Serialize, Deserialize, Debug, Copy, Clone)]
+#[derive(Serialize, Deserialize, Debug)]
+struct TemplatedTokenUri {
+    uri_template: String,
+    checked_tokens: Vec<U256>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
 struct ContractData {
+    /// Type of this contract (the fields below are currently only used for
+    /// ERC721 contracts and should probably be part of [ContractType::ERC721])
     #[serde(rename = "type")]
     contract_type: ContractType,
+    /// Token URIs that could not be templated. This could be because they're
+    /// generated on-the-fly, are random (e.g. because the contract does stupid
+    /// stuff) or that just don't have the token ID as part of their url and
+    /// thusbe compacted into a template.
+    individual_uris: HashMap<U256, String>,
+    /// Stores the URI for multiple (usually all) tokens in this contract. This
+    /// can only be used if the tokenURI contains the tokenID.
+    templated: Vec<TemplatedTokenUri>,
+    /// Token IDs that are known to exist (seen a transfer event), but where we
+    /// requested the tokenURI (for example because we assumed it to be
+    /// equivalent to the templated token uri). Note that inclusion in this list
+    /// does not say anything about the real tokenURI, just that we did not
+    /// request it and thus may assume a templated tokenURI in templated.
+    unchecked_tokens: Vec<U256>,
 }
 
 #[derive(Debug)]
 pub enum Error {
     IO(io::Error),
     Encoding(serde_json::Error),
+    UnknownContract,
 }
 impl From<io::Error> for Error {
     fn from(e: io::Error) -> Self {
@@ -52,12 +75,32 @@ impl<'a> MemoryStorage<'a> {
 }
 
 impl<'a> Storage for MemoryStorage<'a> {
+    type Error = Error;
+
     fn get_contract_type(&self, addr: Address) -> Option<ContractType> {
         Some(self.contracts.get(&addr)?.contract_type)
     }
 
     fn store_contract_type(&mut self, addr: Address, contract_type: ContractType) -> ContractType {
-        let data = ContractData { contract_type };
+        let data = ContractData {
+            contract_type,
+            individual_uris: HashMap::new(),
+            templated: Vec::new(),
+            unchecked_tokens: Vec::new(),
+        };
         self.contracts.entry(addr).or_insert(data).contract_type
+    }
+
+    fn add_unchecked_token(&mut self, addr: Address, token: U256) -> Result<(), Error> {
+        let data = self.contracts.get_mut(&addr).ok_or(Error::UnknownContract)?;
+        data.unchecked_tokens.push(token);
+        Ok(())
+    }
+
+    fn add_token(&mut self, addr: Address, token: U256, uri: String) -> Result<(), Error> {
+        // TODO: For now we always store individual urls, change this to the templated urls where possible.
+        let data = self.contracts.get_mut(&addr).ok_or(Error::UnknownContract)?;
+        data.individual_uris.insert(token, uri);
+        Ok(())
     }
 }
