@@ -5,6 +5,8 @@ use crate::types::ContractType;
 
 use super::{Storage};
 
+const TEMPLATE_MIN_TOKEN_COUNT: usize = 5;
+
 #[derive(Serialize, Deserialize, Debug)]
 struct TemplatedTokenUri {
     uri_template: String,
@@ -102,5 +104,28 @@ impl<'a> Storage for MemoryStorage<'a> {
         let data = self.contracts.get_mut(&addr).ok_or(Error::UnknownContract)?;
         data.individual_uris.insert(token, uri);
         Ok(())
+    }
+
+    fn token_uri(&self, addr: Address, token: U256) -> Option<&String> {
+        self.contracts[&addr].individual_uris.get(&token)
+    }
+
+    fn want_more_uris(&self, addr: Address) -> bool {
+        let data = &self.contracts[&addr];
+        // In the long run we probably want to get the uri of all tokens.
+        // Alternatively it could also be possible to use symbolic execution to
+        // know for sure there can't be any other uri (not even in the future).
+        // But, especially in the beginning, we don't have to request them all
+        // immediately and can (instead store the list of tokens in
+        // unchecked_tokens).
+        //
+        // This may be a bit restrictive. For example if we have two templates
+        // we could stop if both templates have enough tokens. However this
+        // should probably be a rare case and a single template should catch
+        // >99% of the templated cases.
+        !(
+            data.templated.len() == 1 && 
+            data.templated[0].checked_tokens.len() > TEMPLATE_MIN_TOKEN_COUNT
+        )
     }
 }

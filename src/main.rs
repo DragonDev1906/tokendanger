@@ -101,34 +101,44 @@ async fn process_logs<T: Transport>(w3: &Web3<T>, logs: Vec<Log>) -> Result<(), 
             ContractType::Unknown => {}
             ContractType::UnknownERC165 => {}
             ContractType::ERC721 { metadata, .. } => {
+                let to = log.topics[2];
+                let token_id = U256::from_big_endian(&log.topics[3].0);
                 // Only relevant if this isn't a token burn. It may still be burned in
                 // the future (e.g. if we're processing old blocks), which means getting the
                 // metadata will fail, there is nothing we can do about that unless we have
                 // an archive node.
-                if metadata && log.topics[2].0 != [0u8; 32] {
-                    match erc721::metadata_token_uri(
-                        w3,
-                        log.address,
-                        U256::from_big_endian(&log.topics[3].0),
-                    )
-                    .await
-                    {
-                        Ok(uri) => {
-                            println!("URI: {}", uri);
-                        }
-                        Err(erc721::Error::Contract(web3::contract::Error::Api(
-                            web3::Error::Rpc(e),
-                        ))) if e.code.code() == 3 => {
-                            println!("tokenUri reverted: {:?}", log);
-                        }
-                        Err(e) => panic!("Unexpected error: {:?}", e),
-                    };
+                if metadata && to.0 != [0u8; 32] {
+                    match storage.token_uri(log.address, token_id) {
+                        Some(uri) => println!("FOUND: {} {} - {}", log.address, token_id, uri),
+                        None => {
+                            if !storage.want_more_uris(log.address) {
+                                println!("SKIP : {} {}", log.address, token_id);
+                            } else {
+                                match erc721::metadata_token_uri(
+                                    w3,
+                                    log.address,
+                                    token_id,
+                                )
+                                .await
+                                {
+                                    Ok(uri) => {
+                                        println!("REQUE: {} {} - {}", log.address, token_id, uri);
+                                        storage.add_token(log.address, token_id, uri).unwrap();
+                                    }
+                                    Err(erc721::Error::Contract(web3::contract::Error::Api(
+                                        web3::Error::Rpc(e),
+                                    ))) if e.code.code() == 3 => {
+                                        println!("tokenUri reverted: {:?}", log);
+                                    }
+                                    Err(e) => panic!("Unexpected error: {:?}", e),
+                                };
+                            }
+                        },
+                    }
                 }
             }
             ContractType::MaybeERC20 => {}
         }
-
-        // println!("Contract type: {:?}", contract_type);
     }
 
     // Store contact type info back to file
