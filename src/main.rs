@@ -1,18 +1,19 @@
-use std::{collections::HashMap, env, fs::File, ops::Range};
-
-use async_recursion::async_recursion;
-use dynchunkiter::DynChunkIter;
-use hex_literal::hex;
-use serde::{Deserialize, Serialize, Serializer};
-use web3::{
-    types::{Address, BlockNumber, Filter, FilterBuilder, Log, H256, U256, U64},
-    Transport, Web3,
-};
-
 mod dynchunkiter;
 mod erc165;
 mod erc721;
 
+use std::{collections::HashMap, env, fs::File, ops::Range};
+use async_recursion::async_recursion;
+use dynchunkiter::DynChunkIter;
+use hex_literal::hex;
+use serde::{Deserialize, Serialize};
+use web3::{
+    types::{FilterBuilder, Log, H256, U256, U64},
+    Transport, Web3,
+};
+
+const PERSISTENCE_PATH: &'static str = "./contracts.json";
+const TOO_MANY_RESULTS_ERRCODE: i64 = -32005;
 const ERC721_TRANSFER_EVENT: H256 = H256(hex!(
     "ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 ));
@@ -39,104 +40,40 @@ async fn main() {
             Err(e) => panic!("Task returned error: {:?}", e),
         }
     }
-
-    // Get latest block height
-    // let block_num = w3
-    //     .eth()
-    //     .block_number()
-    //     .await
-    //     .expect("Could not receive block height");
-    // println!("Block Number: {}", block_num);
-
-    // ERC 165
-    // 57f1887a8bf19b14fc0df6fd9b2acc9af147ea85 // ERC-721 ?
-    // 0000000000a39bb272e79075ade125fd351887ac // ERC-20 without ERC-165
-    // let addr = hex!("0000000000a39bb272e79075ade125fd351887ac").into();
-    // let is721 = erc165::is_erc721(&w3, addr).await.unwrap();
-    // println!("Is EIP-721: {}", is721);
-
-    // Topic filter
-    // let filter = FilterBuilder::default()
-    //     .from_block(start.into())
-    //     .to_block(end.into())
-    //     .topics(Some(vec![ERC721_TRANSFER_EVENT]), None, None, None)
-    //     .build();
-    // let logs = w3.eth().logs(filter).await.unwrap();
-    // // for l in &logs[..100] {
-    // //     println!("Log: {:#?}", l);
-    // // }
-
-    // let addresses: HashSet<Address> = logs.iter().map(|l| l.address).collect();
-
-    // let mut tokens: Vec<(Address, TransferEvent)> = logs
-    //     .iter()
-    //     .filter_map(|l| match l.topics.len() {
-    //         4 => Some((l.address, TransferEvent::MaybeERC721(l.topics[3]))),
-    //         3 => Some((l.address, TransferEvent::MaybeERC20)),
-    //         _ => None, // Log doesn't match ERC20 or ERC721 events.
-    //     })
-    //     .collect();
-    // let token_count = tokens.len();
-    // tokens.sort_unstable();
-    // tokens.dedup();
-
-    // println!("Logs: {}", logs.len());
-    // println!("Unique contracts: {}", addresses.len());
-    // println!("Tokens: {}", token_count);
-    // println!("Unique Tokens: {}", tokens.len());
-
-    // task(&w3, start.into()..end.into()).await.unwrap();
 }
 
-#[derive(Debug, PartialEq, Eq, Ord, PartialOrd)]
-enum TransferEvent {
-    MaybeERC721(H256),
-    MaybeERC20,
-}
+#[async_recursion(?Send)]
+async fn task<T: Transport>(w3: &Web3<T>, range: Range<U64>) -> Result<usize, TaskError> {
+    // ERC721_TRANSFER_EVENT also catches ERC20 Transfers, as the only
+    // difference is that the third param is indexed.
 
-#[derive(Debug)]
-enum TaskError {
-    Web3(web3::Error),
-    Erc165(erc165::Error),
-}
+    // Request all relevant events in this range.
+    let topic1 = vec![ERC721_TRANSFER_EVENT];
+    let filter = FilterBuilder::default()
+        .from_block(range.start.into())
+        .to_block(range.end.into())
+        .topics(Some(topic1), None, None, None)
+        .build();
+    let logs = match w3.eth().logs(filter).await {
+        Ok(v) => v,
+        Err(web3::Error::Rpc(e)) if e.code.code() == TOO_MANY_RESULTS_ERRCODE => {
+            // Split range in two parts and call recursively (try to avoid this
+            // case as it results in a "useless" call that just returns the too
+            // many results error).
+            let middle = (range.start + range.end) / 2;
+            let lower_amount = task(w3, range.start..middle).await?;
+            let upper_amount = task(w3, middle..range.end).await?;
+            return Ok(lower_amount + upper_amount);
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let return_amount = logs.len();
 
-impl From<web3::Error> for TaskError {
-    fn from(e: web3::Error) -> Self {
-        TaskError::Web3(e)
-    }
-}
-impl From<erc165::Error> for TaskError {
-    fn from(e: erc165::Error) -> Self {
-        TaskError::Erc165(e)
-    }
-}
+    // Process the results we got.
+    processLogs(w3, logs).await?;
 
-async fn contract_type<T: Transport>(
-    w3: &Web3<T>,
-    log: &Log,
-) -> Result<ContractType, erc165::Error> {
-    let addr = log.address;
-    println!("Request type for {}", addr);
-    if !erc165::is_eip165(w3, addr).await? {
-        return if log.topics.len() == 3 && log.data.0.len() == 32 {
-            Ok(ContractType::MaybeERC20)
-        } else {
-            Ok(ContractType::Unknown)
-        };
-    }
-
-    if erc165::is_erc721_unchecked(w3, addr).await? {
-        Ok(ContractType::ERC721 {
-            metadata: erc165::is_erc721metadata_unchecked(w3, addr).await?,
-            enumerable: erc165::is_erc721enumerable_unchecked(w3, addr).await?,
-        })
-    } else {
-        Ok(ContractType::UnknownERC165)
-    }
+    Ok(return_amount)
 }
-
-const PERSISTENCE_PATH: &'static str = "./contracts.json";
-const TOO_MANY_RESULTS_ERRCODE: i64 = -32005;
 
 async fn processLogs<T: Transport>(w3: &Web3<T>, logs: Vec<Log>) -> Result<(), TaskError> {
     // Read cached contact type info from file
@@ -202,37 +139,45 @@ async fn processLogs<T: Transport>(w3: &Web3<T>, logs: Vec<Log>) -> Result<(), T
     Ok(())
 }
 
-#[async_recursion(?Send)]
-async fn task<T: Transport>(w3: &Web3<T>, range: Range<U64>) -> Result<usize, TaskError> {
-    // ERC721_TRANSFER_EVENT also catches ERC20 Transfers, as the only
-    // difference is that the third param is indexed.
+async fn contract_type<T: Transport>(
+    w3: &Web3<T>,
+    log: &Log,
+) -> Result<ContractType, erc165::Error> {
+    let addr = log.address;
+    println!("Request type for {}", addr);
+    if !erc165::is_eip165(w3, addr).await? {
+        return if log.topics.len() == 3 && log.data.0.len() == 32 {
+            Ok(ContractType::MaybeERC20)
+        } else {
+            Ok(ContractType::Unknown)
+        };
+    }
 
-    // Request all relevant events in this range.
-    let topic1 = vec![ERC721_TRANSFER_EVENT];
-    let filter = FilterBuilder::default()
-        .from_block(range.start.into())
-        .to_block(range.end.into())
-        .topics(Some(topic1), None, None, None)
-        .build();
-    let logs = match w3.eth().logs(filter).await {
-        Ok(v) => v,
-        Err(web3::Error::Rpc(e)) if e.code.code() == TOO_MANY_RESULTS_ERRCODE => {
-            // Split range in two parts and call recursively (try to avoid this
-            // case as it results in a "useless" call that just returns the too
-            // many results error).
-            let middle = (range.start + range.end) / 2;
-            let lower_amount = task(w3, range.start..middle).await?;
-            let upper_amount = task(w3, middle..range.end).await?;
-            return Ok(lower_amount + upper_amount);
-        }
-        Err(e) => return Err(e.into()),
-    };
-    let return_amount = logs.len();
+    if erc165::is_erc721_unchecked(w3, addr).await? {
+        Ok(ContractType::ERC721 {
+            metadata: erc165::is_erc721metadata_unchecked(w3, addr).await?,
+            enumerable: erc165::is_erc721enumerable_unchecked(w3, addr).await?,
+        })
+    } else {
+        Ok(ContractType::UnknownERC165)
+    }
+}
 
-    // Process the results we got.
-    processLogs(w3, logs).await?;
+#[derive(Debug)]
+enum TaskError {
+    Web3(web3::Error),
+    Erc165(erc165::Error),
+}
 
-    Ok(return_amount)
+impl From<web3::Error> for TaskError {
+    fn from(e: web3::Error) -> Self {
+        TaskError::Web3(e)
+    }
+}
+impl From<erc165::Error> for TaskError {
+    fn from(e: erc165::Error) -> Self {
+        TaskError::Erc165(e)
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Copy, Clone)]
